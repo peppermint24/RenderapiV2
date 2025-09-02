@@ -1,800 +1,957 @@
-"""
-Property Score API (Render-ready)
-- SES from tract polygons + tract score lookup (fallback to ZIP affluence)
-- Flood resiliency from NFHL (partial-field mapping + retries) + NFIP claims policy
-- Humidity (ZIP risk with county/state medians as fallback)
-- Build year via Perplexity
-- Optional Google-reviews support inside /score/total
-
-All scores are 0–100 where higher = safer/better (stars are 0–5).
-"""
+# ===========================
+# PRODUCTION FASTAPI APP - main.py
+# File-based caching with area JSON files on mounted disk
+# ===========================
 
 import os
 import json
-import logging
-from typing import Optional, Dict, Any, List, Tuple
-from datetime import datetime
-import math
-
-from fastapi import FastAPI, Depends, HTTPException, Header, Query, Body
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field
-import uvicorn
+import time
+import requests
+import re
+import hashlib
+import asyncio
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Optional, List, Dict, Any, Tuple
+import uuid
+import fcntl
+import glob
 
 import pandas as pd
 import numpy as np
-
-from shapely import wkb as shapely_wkb
+import geopandas as gpd
 from shapely.geometry import Point
-from shapely.strtree import STRtree
 
-import httpx
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+import uvicorn
 
-# ---------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------
+import logging
+
+# Setup logging
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("property-score-api")
+logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------
-# ENV & Defaults
-# ---------------------------------------------------------------------
-API_KEY = os.getenv("API_KEY")  # REQUIRED
-if not API_KEY:
-    raise ValueError("API_KEY env var is required")
-API_BEARER = os.getenv("API_BEARER")  # optional secondary bearer
+# ===========================
+# CONFIGURATION
+# ===========================
 
-DATA_DIR = os.getenv("DATA_DIR", "/data")
+# Environment variables
+GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "").strip()
+PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY", "").strip()
+MAX_LOCATIONS_TO_SCAN = int(os.getenv("MAX_LOCATIONS_TO_SCAN", "400"))
+DATA_EXPIRY_MONTHS = int(os.getenv("DATA_EXPIRY_MONTHS", "3"))
+AREA_RESCAN_DAYS = int(os.getenv("AREA_RESCAN_DAYS", "30"))
+MODEL_VERSION = os.getenv("MODEL_VERSION", "risk-v1")
+SCORING_VERSION = os.getenv("SCORING_VERSION", "2025-08-29")
 
-# You told me your file names were changed to these:
-GEOMS_PATH    = os.getenv("GEOMS_PATH", os.path.join(DATA_DIR, "Tracts WKB.parquet"))
-SCORES_PATH   = os.getenv("SCORES_PATH", os.path.join(DATA_DIR, "Tract Lookup Fixed.json"))
-HUMIDITY_PATH = os.getenv("HUMIDITY_PATH", os.path.join(DATA_DIR, "Humidity Medians.parquet"))
-CLAIMS_PATH   = os.getenv("CLAIMS_PATH", os.path.join(DATA_DIR, "Claims with Medians.parquet"))
+# Data paths - Render persistent disk mount
+DATA_MOUNT_PATH = os.getenv("DATA_MOUNT_PATH", "/mnt/data")
+DATA = Path(DATA_MOUNT_PATH)
+STATIC_DATA = DATA / "static"
+CACHE_DATA = DATA / "cache"
+AREAS_DATA = DATA / "areas"
 
-# Optional (ZIP affluence fallback: either affluence_0_100 or mhi_dollars)
-AFFLUENCE_ZIP_PATH = os.getenv("AFFLUENCE_ZIP_PATH", os.path.join(DATA_DIR, "zip_affluence.csv"))
+# Ensure cache directories exist
+CACHE_DATA.mkdir(parents=True, exist_ok=True)
+AREAS_DATA.mkdir(parents=True, exist_ok=True)
 
-PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
-PERPLEXITY_MODEL   = os.getenv("PERPLEXITY_MODEL", "sonar")
-
-# Weights (can be tuned via env)
-W_SES        = float(os.getenv("W_SES",        "0.15"))  # “Area Affluence” in UI
-W_BUILD_YEAR = float(os.getenv("W_BUILD_YEAR", "0.20"))
-W_FLOOD      = float(os.getenv("W_FLOOD",      "0.45"))
-W_HUMIDITY   = float(os.getenv("W_HUMIDITY",   "0.10"))
-# Google’s placeholder (actual effective 0.10 or 0.20 applied dynamically)
-W_GOOGLE_PLACEHOLDER = float(os.getenv("W_GOOGLE", "0.10"))
-
-# ---------------------------------------------------------------------
-# FastAPI app
-# ---------------------------------------------------------------------
-app = FastAPI(
-    title="Property Score API",
-    version="1.1.0",
-    docs_url=None, redoc_url=None, openapi_url=None
-)
-security = HTTPBearer(auto_error=False)
-
-# ---------------------------------------------------------------------
-# Model / DataStore
-# ---------------------------------------------------------------------
-class DataStore:
-    # SES / Tracts
-    ses_tree: Optional[STRtree] = None
-    ses_geoms: List = []
-    ses_geoids: List[str] = []
-    ses_scores: Dict[str, float] = {}
-
-    # Humidity (ZIP risk + medians)
-    humidity: Optional[pd.DataFrame] = None  # index on 'zip'
-    # Claims (ZIP proportion + medians) — NOTE: medians are NOT used in flood math per policy
-    claims: Optional[pd.DataFrame] = None    # index on 'zip'
-
-    # ZIP affluence: zip -> 0..100
-    zip_affluence: Dict[str, float] = {}
-
-    last_reload: Dict[str, str] = {}
-
-data_store = DataStore()
-
-# ---------------------------------------------------------------------
-# Auth helpers
-# ---------------------------------------------------------------------
-def compare_api_keys(provided: str, expected: Optional[str]) -> bool:
-    if not expected or provided is None:
-        return False
-    if len(provided) != len(expected):
-        return False
-    # constant time
-    acc = 0
-    for a, b in zip(provided, expected):
-        acc |= ord(a) ^ ord(b)
-    return acc == 0
-
-def verify_api_key(
-    x_api_key: Optional[str] = Header(None),
-    authorization: Optional[HTTPAuthorizationCredentials] = Depends(security)
-) -> bool:
-    if x_api_key and compare_api_keys(x_api_key, API_KEY):
-        return True
-    if API_BEARER and x_api_key and compare_api_keys(x_api_key, API_BEARER):
-        return True
-    if authorization and authorization.credentials:
-        if compare_api_keys(authorization.credentials, API_KEY):
-            return True
-        if API_BEARER and compare_api_keys(authorization.credentials, API_BEARER):
-            return True
-    raise HTTPException(status_code=401, detail="Invalid or missing API key")
-
-# ---------------------------------------------------------------------
-# File readers
-# ---------------------------------------------------------------------
-def _read_parquet_or_csv(path: str) -> Optional[pd.DataFrame]:
-    if not os.path.exists(path):
-        return None
-    try:
-        if path.lower().endswith(".parquet"):
-            return pd.read_parquet(path)
-        # csv fallbacks
-        for enc in ["utf-8", "utf-8-sig", "cp1252", "latin1"]:
-            try:
-                return pd.read_csv(path, encoding=enc, engine="python")
-            except Exception:
-                continue
-        return None
-    except Exception as e:
-        logger.warning(f"Failed to read {path}: {e}")
-        return None
-
-def _zip_norm(s: Any) -> str:
-    if s is None: return ""
-    z = str(s)
-    # keep 3-5 digits then zfill
-    import re
-    m = re.search(r"(\d{3,5})", z)
-    return m.group(1).zfill(5) if m else ""
-
-# ---------------------------------------------------------------------
-# Loaders
-# ---------------------------------------------------------------------
-def load_ses_data():
-    # geometries (parquet with columns: GEOID:str, wkb:bytes)
-    if not os.path.exists(GEOMS_PATH):
-        logger.warning(f"Tract parquet not found: {GEOMS_PATH}")
-    else:
-        df = pd.read_parquet(GEOMS_PATH)
-        if not {"GEOID", "wkb"}.issubset(df.columns):
-            raise RuntimeError(f"{GEOMS_PATH} must contain columns: GEOID, wkb")
-        geoms = [shapely_wkb.loads(b) for b in df["wkb"]]
-        data_store.ses_tree = STRtree(geoms)
-        data_store.ses_geoms = geoms
-        data_store.ses_geoids = df["GEOID"].astype(str).tolist()
-        logger.info(f"Loaded {len(geoms):,} tract geometries from {GEOMS_PATH}")
-
-    # scores (JSON mapping "11-digit GEOID" -> score 0..100)
-    if not os.path.exists(SCORES_PATH):
-        logger.warning(f"SES scores not found: {SCORES_PATH}")
-    else:
-        with open(SCORES_PATH, "r") as f:
-            data_store.ses_scores = json.load(f)
-        logger.info(f"Loaded {len(data_store.ses_scores):,} SES scores from {SCORES_PATH}")
-
-    data_store.last_reload["ses"] = datetime.now().isoformat()
-    return {
-        "polygons_loaded": len(data_store.ses_geoms),
-        "scores_loaded": len(data_store.ses_scores),
-        "paths": {"geoms": GEOMS_PATH, "scores": SCORES_PATH}
-    }
-
-def load_humidity_data():
-    df = _read_parquet_or_csv(HUMIDITY_PATH)
-    if df is None:
-        logger.warning(f"Humidity file not found/readable: {HUMIDITY_PATH}")
-        data_store.humidity = None
-    else:
-        # expected cols: zip, humidity_risk_0_100, (optional) humidity_county_median, humidity_state_median
-        cols = {c.lower(): c for c in df.columns}
-        zc = cols.get("zip") or cols.get("zip_code") or cols.get("zcta") or "zip"
-        df["zip"] = df[zc].apply(_zip_norm)
-        df["humidity_risk_0_100"] = pd.to_numeric(df.get("humidity_risk_0_100"), errors="coerce")
-        # medians may exist
-        for m in ["humidity_county_median", "humidity_state_median", "humidity_nearest_median"]:
-            if m in df.columns:
-                df[m] = pd.to_numeric(df[m], errors="coerce")
-        data_store.humidity = df.set_index("zip")
-        logger.info(f"Loaded humidity rows: {len(data_store.humidity):,} from {HUMIDITY_PATH}")
-
-    data_store.last_reload["humidity"] = datetime.now().isoformat()
-    return {"rows_loaded": 0 if data_store.humidity is None else len(data_store.humidity),
-            "path": HUMIDITY_PATH}
-
-def load_flood_claims():
-    df = _read_parquet_or_csv(CLAIMS_PATH)
-    if df is None:
-        logger.warning(f"Claims file not found/readable: {CLAIMS_PATH}")
-        data_store.claims = None
-    else:
-        # expected cols: zip, claims_proportion_0_1 (plus medians we WILL NOT USE)
-        cols = {c.lower(): c for c in df.columns}
-        zc = cols.get("zip") or cols.get("zip_code") or "zip"
-        vc = cols.get("claims_proportion_0_1") or cols.get("proportion")
-        if not (zc and vc):
-            logger.warning("Claims file missing required columns (zip + claims_proportion_0_1/proportion)")
-            data_store.claims = None
-        else:
-            df["zip"] = df[zc].apply(_zip_norm)
-            df["claims_proportion_0_1"] = pd.to_numeric(df[vc], errors="coerce")
-            data_store.claims = df.set_index("zip")
-            logger.info(f"Loaded claims rows: {len(data_store.claims):,} from {CLAIMS_PATH}")
-
-    data_store.last_reload["flood_claims"] = datetime.now().isoformat()
-    return {"rows_loaded": 0 if data_store.claims is None else len(data_store.claims),
-            "path": CLAIMS_PATH}
-
-def load_zip_affluence():
-    d = _read_parquet_or_csv(AFFLUENCE_ZIP_PATH)
-    if d is None:
-        logger.warning(f"AFFLUENCE_ZIP_PATH not found or unreadable: {AFFLUENCE_ZIP_PATH}")
-        data_store.zip_affluence = {}
-        return {"rows_loaded": 0, "path": AFFLUENCE_ZIP_PATH}
-
-    cols = {c.lower(): c for c in d.columns}
-    zc = cols.get("zip") or cols.get("zip5") or cols.get("zipcode") or cols.get("zcta")
-    if not zc:
-        logger.warning(f"ZIP affluence file lacks 'zip' column: {list(d.columns)}")
-        data_store.zip_affluence = {}
-        return {"rows_loaded": 0, "path": AFFLUENCE_ZIP_PATH}
-
-    acc: Dict[str, float] = {}
-    if "affluence_0_100" in cols:
-        ac = cols["affluence_0_100"]
-        tmp = d[[zc, ac]].copy()
-        tmp["zip"] = tmp[zc].apply(_zip_norm)
-        tmp["affluence_0_100"] = pd.to_numeric(tmp[ac], errors="coerce")
-        acc = {z: float(v) for z, v in zip(tmp["zip"], tmp["affluence_0_100"]) if pd.notna(v)}
-    else:
-        # derive percentile from mhi_dollars if present
-        mhic = cols.get("mhi_dollars") or cols.get("median_household_income")
-        if mhic:
-            tmp = d[[zc, mhic]].copy()
-            tmp["zip"] = tmp[zc].apply(_zip_norm)
-            tmp[mhic]  = pd.to_numeric(tmp[mhic], errors="coerce")
-            series = tmp[mhic].dropna()
-            if len(series) > 0:
-                pct = series.rank(pct=True) * 100.0
-                tmp["affluence_0_100"] = tmp[mhic].map(pct)
-                acc = {z: float(v) for z, v in zip(tmp["zip"], tmp["affluence_0_100"]) if pd.notna(v)}
-        else:
-            logger.warning("ZIP affluence file has neither affluence_0_100 nor mhi_dollars")
-            acc = {}
-
-    data_store.zip_affluence = acc
-    logger.info(f"Loaded ZIP affluence rows: {len(acc):,} from {AFFLUENCE_ZIP_PATH}")
-    return {"rows_loaded": len(acc), "path": AFFLUENCE_ZIP_PATH}
-
-# ---------------------------------------------------------------------
-# SES lookup
-# ---------------------------------------------------------------------
-def point_in_polygon_lookup(lat: float, lon: float) -> Tuple[Optional[str], Optional[float]]:
-    if not data_store.ses_tree:
-        return None, None
-    pt = Point(lon, lat)
-
-    # Shapely 2.x preferred: query_bulk
-    try:
-        idxs = data_store.ses_tree.query_bulk([pt])[1].tolist()
-    except Exception:
-        # Fallback: query may return indices or geoms
-        cand = data_store.ses_tree.query(pt)
-        if isinstance(cand, np.ndarray) and cand.dtype.kind in {"i", "u"}:
-            idxs = cand.tolist()
-        else:
-            idxs = range(len(data_store.ses_geoms))
-
-    for idx in idxs:
-        try:
-            geom = data_store.ses_geoms[idx]
-            if geom.covers(pt):
-                geoid = data_store.ses_geoids[idx]
-                return geoid, data_store.ses_scores.get(geoid)
-        except Exception:
-            continue
-    return None, None
-
-# ---------------------------------------------------------------------
-# NFHL discovery + mapping
-# ---------------------------------------------------------------------
-_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Referer": "https://hazards.fema.gov/",
-    "Accept": "application/json,text/plain,*/*",
+FILES = {
+    "SES_TRACT": STATIC_DATA / "Tract Lookup Fixed.json",
+    "SES_ZIP": STATIC_DATA / "Zip Fallback SES Aug 29.json",
+    "FLOOD_ZIP": STATIC_DATA / "flood_zip_floodprop.csv",
+    "FLOOD_CNTY": STATIC_DATA / "County Flood Fallback.csv",
+    "DRY_ZIP": STATIC_DATA / "Humidity Dryness Scores Aug 29.csv",
+    "DRY_CNTY": STATIC_DATA / "County Dryness Data Aug 29.csv",
+    "ZIP_COUNTY": STATIC_DATA / "ZIP_COUNTY_062025.xlsx",
+    "TRACTS_GPKG": STATIC_DATA / "us_all_tracts_2022.gpkg",
 }
-_NFHL_DISCOVERY = {"root": None, "layer": None}
-_SERVICE_ROOTS = [
-    # Newer ArcGIS Server roots (preferred)
-    "https://hazards.fema.gov/server/rest/services/public/NFHL/MapServer",
-    "https://hazards.fema.gov/server/rest/services/NFHL/MapServer",
-    # Legacy fallbacks (often 404 nowadays)
-    "https://hazards.fema.gov/gis/nfhl/rest/services/public/NFHL/MapServer",
-    "https://gis.fema.gov/arcgis/rest/services/NFHL/MapServer",
-]
 
-async def _discover_nfhl_layer() -> bool:
-    async with httpx.AsyncClient(timeout=25.0, headers=_HEADERS) as client:
-        for root in _SERVICE_ROOTS:
-            try:
-                r = await client.get(root, params={"f": "pjson"})
-                if r.status_code != 200:
-                    continue
-                data = r.json()
-                layers = data.get("layers") or []
-                target = None
-                # Prefer “S_Fld_Haz_Ar”
-                for lyr in layers:
-                    if "s_fld_haz_ar" in (lyr.get("name", "").lower()):
-                        target = lyr
-                        break
-                if not target:
-                    # fallback: find a layer with FLD_ZONE field
-                    for lyr in layers:
-                        info = await client.get(f"{root}/{lyr['id']}", params={"f": "pjson"})
-                        if info.status_code != 200:
-                            continue
-                        fields = [f.get("name", "").upper() for f in info.json().get("fields", [])]
-                        if "FLD_ZONE" in fields:
-                            target = lyr
-                            break
-                if target:
-                    _NFHL_DISCOVERY["root"] = root
-                    _NFHL_DISCOVERY["layer"] = target["id"]
-                    logger.info(f"NFHL discovered: root={root}, layer={target['id']} ({target['name']})")
-                    return True
-            except Exception as e:
-                logger.warning(f"NFHL discovery error at {root}: {e}")
-    return False
+# Verify data mount on startup
+if not DATA.exists():
+    logger.error(f"Data mount path {DATA} does not exist!")
+    logger.info("Available paths:", [p for p in Path("/").iterdir() if p.is_dir()])
+else:
+    logger.info(f"Data mount found at {DATA}")
+    if STATIC_DATA.exists():
+        logger.info(f"Static data files: {[f.name for f in STATIC_DATA.iterdir() if f.is_file()]}")
 
-async def query_fema_nfhl(lat: float, lon: float) -> Dict[str, Any]:
-    if not (_NFHL_DISCOVERY["root"] and _NFHL_DISCOVERY["layer"]):
-        ok = await _discover_nfhl_layer()
-        if not ok:
-            return {}
-    root = _NFHL_DISCOVERY["root"]
-    layer = _NFHL_DISCOVERY["layer"]
+# ===========================
+# FILE-BASED CACHE HELPERS
+# ===========================
 
-    params = {
-        "f": "json",
-        "returnGeometry": "false",
-        "outFields": "FLD_ZONE,ZONE_SUBTY,SFHA_TF,STATIC_BFE,DEPTH",
-        "inSR": "4326",
-        "spatialRel": "esriSpatialRelIntersects",
-        "geometryType": "esriGeometryPoint",
-        "geometry": json.dumps({"x": lon, "y": lat, "spatialReference": {"wkid": 4326}}),
-    }
-    url = f"{root}/{layer}/query"
+def area_key_to_filename(area_key: str) -> str:
+    """Convert area key to safe filename"""
+    safe_name = re.sub(r'[^a-zA-Z0-9_-]', '_', area_key.lower())
+    return f"{safe_name}.json"
 
-    async with httpx.AsyncClient(timeout=25.0, headers=_HEADERS) as client:
+def load_json_with_lock(file_path: Path) -> Dict:
+    """Load JSON file with file locking"""
+    if not file_path.exists():
+        return {}
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)  # Shared lock for reading
+            data = json.load(f)
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)  # Unlock
+            return data
+    except Exception as e:
+        logger.error(f"Error loading {file_path}: {e}")
+        return {}
+
+def save_json_with_lock(file_path: Path, data: Dict):
+    """Save JSON file with file locking"""
+    try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(file_path, 'w', encoding='utf-8') as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)  # Exclusive lock for writing
+            json.dump(data, f, indent=2, default=str)
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)  # Unlock
+    except Exception as e:
+        logger.error(f"Error saving {file_path}: {e}")
+
+def get_area_cache_file(area_key: str) -> Path:
+    """Get cache file path for area"""
+    return CACHE_DATA / area_key_to_filename(area_key)
+
+def get_area_completeness_file() -> Path:
+    """Get area completeness tracking file"""
+    return AREAS_DATA / "completeness.json"
+
+def cleanup_expired_places():
+    """Remove expired place records from all area cache files"""
+    expiry_threshold = datetime.now(timezone.utc) - timedelta(days=30 * DATA_EXPIRY_MONTHS)
+    cleaned_count = 0
+    
+    for cache_file in CACHE_DATA.glob("*.json"):
         try:
-            r = await client.get(url, params=params)
-            if r.status_code != 200 or "json" not in (r.headers.get("Content-Type") or "").lower():
-                # rediscover once
-                if await _discover_nfhl_layer():
-                    root = _NFHL_DISCOVERY["root"]; layer = _NFHL_DISCOVERY["layer"]
-                    url = f"{root}/{layer}/query"
-                    r = await client.get(url, params=params)
-                    if r.status_code != 200 or "json" not in (r.headers.get("Content-Type") or "").lower():
-                        return {}
-                else:
-                    return {}
+            data = load_json_with_lock(cache_file)
+            if not data or "results" not in data:
+                continue
+                
+            original_count = len(data["results"])
+            
+            # Filter out expired places
+            data["results"] = [
+                place for place in data["results"]
+                if place.get("metadata", {}).get("scored_at") and
+                datetime.fromisoformat(place["metadata"]["scored_at"].replace('Z', '+00:00')) > expiry_threshold
+            ]
+            
+            expired_count = original_count - len(data["results"])
+            if expired_count > 0:
+                data["last_cleanup"] = datetime.now(timezone.utc).isoformat()
+                save_json_with_lock(cache_file, data)
+                cleaned_count += expired_count
+                logger.info(f"Cleaned {expired_count} expired places from {cache_file.name}")
+                
+        except Exception as e:
+            logger.error(f"Error cleaning {cache_file}: {e}")
+    
+    return cleaned_count
+
+# ===========================
+# DATA LOADING
+# ===========================
+
+def load_json(path: Path):
+    if not path.exists(): return {}
+    try:
+        with open(path, "r", encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Error loading {path}: {e}")
+        return {}
+
+def norm_zip(z):
+    if z is None: return None
+    s = "".join(ch for ch in str(z) if ch.isdigit())[:5]
+    return s.zfill(5) if s else None
+
+# Load all static data files
+logger.info("Loading static data files...")
+ses_tract = load_json(FILES["SES_TRACT"])
+ses_zip = load_json(FILES["SES_ZIP"])
+
+flood_zip = pd.read_csv(FILES["FLOOD_ZIP"], dtype={"zip_code": str}) if FILES["FLOOD_ZIP"].exists() else pd.DataFrame()
+if not flood_zip.empty:
+    flood_zip["zip_code"] = flood_zip["zip_code"].map(norm_zip)
+
+flood_cnty = pd.read_csv(FILES["FLOOD_CNTY"], dtype={"county_fips": str}) if FILES["FLOOD_CNTY"].exists() else pd.DataFrame()
+
+dry_zip = pd.read_csv(FILES["DRY_ZIP"], dtype={"zip": str}) if FILES["DRY_ZIP"].exists() else pd.DataFrame()
+if not dry_zip.empty:
+    dry_zip["zip"] = dry_zip["zip"].map(norm_zip)
+
+dry_cnty = pd.read_csv(FILES["DRY_CNTY"], dtype={"county_fips": str}) if FILES["DRY_CNTY"].exists() else pd.DataFrame()
+
+zip_county = pd.read_excel(FILES["ZIP_COUNTY"], dtype=str) if FILES["ZIP_COUNTY"].exists() else pd.DataFrame()
+if not zip_county.empty:
+    zip_county = zip_county.rename(columns={"ZIP": "zip", "COUNTY": "county_fips"})
+    zip_county["zip"] = zip_county["zip"].map(norm_zip)
+    if "TOT_RATIO" in zip_county:
+        zip_county["TOT_RATIO"] = pd.to_numeric(zip_county["TOT_RATIO"], errors="coerce").fillna(0.0)
+
+# Optional tracts geodata
+tracts_gdf = None
+if FILES["TRACTS_GPKG"].exists():
+    try:
+        tracts_gdf = gpd.read_file(FILES["TRACTS_GPKG"])
+        if tracts_gdf is not None and tracts_gdf.crs is None:
+            tracts_gdf.set_crs("EPSG:4269", inplace=True)
+        logger.info(f"Loaded {len(tracts_gdf)} tracts")
+    except Exception as e:
+        logger.warning(f"Could not load tracts: {e}")
+
+logger.info(f"Data loaded - SES_TRACT: {len(ses_tract)}, SES_ZIP: {len(ses_zip)}, FLOOD_ZIP: {len(flood_zip)}")
+
+# ===========================
+# GOOGLE API HELPERS
+# ===========================
+
+def http_get(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    out = {"http_status": None, "google_status": None, "error_message": None, "json": None}
+    try:
+        r = requests.get(url, params=params, timeout=30)
+        out["http_status"] = r.status_code
+        try:
             data = r.json()
-            feats = data.get("features") or []
-            if not feats:
-                return {}
-            attrs = feats[0].get("attributes", {}) or {}
-            # normalize keys we use later
-            return {
-                "zone": attrs.get("FLD_ZONE"),
-                "zone_subtype": attrs.get("ZONE_SUBTY"),
-                "sfha": True if attrs.get("SFHA_TF") == "T" else (False if attrs.get("SFHA_TF") == "F" else None),
-                "depth_ft": attrs.get("DEPTH"),
+        except Exception:
+            data = {"_non_json_body": r.text[:400]}
+        out["json"] = data
+        out["google_status"] = data.get("status")
+        out["error_message"] = data.get("error_message")
+    except Exception as e:
+        out["error_message"] = f"{type(e).__name__}: {e}"
+    return out
+
+def is_hotel_or_motel(place_types: List[str]) -> bool:
+    """Filter to only hotels and motels"""
+    if not place_types:
+        return False
+    types_str = " ".join(place_types).lower()
+    return "hotel" in types_str or "motel" in types_str
+
+def google_text_search(query: str, max_results: int = 400) -> List[Dict]:
+    """Search for hotels/motels with pagination"""
+    if not GOOGLE_PLACES_API_KEY:
+        return []
+    
+    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+    params = {"query": query, "key": GOOGLE_PLACES_API_KEY, "type": "lodging"}
+    
+    results = []
+    page = 0
+    
+    while len(results) < max_results:
+        page += 1
+        resp = http_get(url, params)
+        
+        if resp["google_status"] != "OK":
+            logger.error(f"Google search failed: {resp}")
+            break
+            
+        data = resp["json"]
+        page_results = data.get("results", [])
+        
+        # Filter to hotels/motels only
+        filtered_results = [r for r in page_results if is_hotel_or_motel(r.get("types", []))]
+        results.extend(filtered_results)
+        
+        # Check for next page
+        next_token = data.get("next_page_token")
+        if not next_token or len(page_results) == 0:
+            break
+            
+        time.sleep(2)  # Required delay for next_page_token
+        params = {"pagetoken": next_token, "key": GOOGLE_PLACES_API_KEY}
+    
+    return results[:max_results]
+
+def extract_zip_from_components(components: list) -> Optional[str]:
+    """Extract ZIP from Google address components (PRODUCTION: address_components only)"""
+    if not components:
+        return None
+        
+    for comp in components:
+        types = comp.get("types", [])
+        if "postal_code" in types:
+            val = comp.get("long_name") or comp.get("short_name")
+            if val:
+                s = "".join(ch for ch in str(val) if ch.isdigit())[:5]
+                if s and len(s) >= 5:
+                    return s.zfill(5)
+    return None
+
+def google_place_details(place_id: str) -> Tuple[Optional[Dict], str]:
+    """Get place details with ZIP extraction"""
+    if not GOOGLE_PLACES_API_KEY or not place_id:
+        return None, "no_api_key"
+    
+    url = "https://maps.googleapis.com/maps/api/place/details/json"
+    params = {
+        "place_id": place_id,
+        "fields": "address_component,formatted_address,geometry,name,vicinity,types,rating,user_ratings_total",
+        "key": GOOGLE_PLACES_API_KEY
+    }
+    
+    resp = http_get(url, params)
+    if resp["google_status"] != "OK":
+        return None, f"api_error_{resp['google_status']}"
+    
+    result = resp["json"].get("result")
+    if not result:
+        return None, "no_result"
+    
+    # Extract ZIP from address components (PRODUCTION: no formatted address parsing)
+    components = result.get("address_components", [])
+    zip_code = extract_zip_from_components(components)
+    
+    return {
+        "place_id": place_id,
+        "name": result.get("name"),
+        "address": result.get("formatted_address"),
+        "geometry": result.get("geometry", {}).get("location", {}),
+        "types": result.get("types", []),
+        "rating": result.get("rating"),
+        "user_ratings_total": result.get("user_ratings_total"),
+        "zip": zip_code,
+        "zip_source": "place_details" if zip_code else None
+    }, "success"
+
+def reverse_geocode_for_zip(lat: float, lng: float) -> Optional[str]:
+    """Fallback ZIP extraction via reverse geocoding"""
+    if not GOOGLE_PLACES_API_KEY:
+        return None
+    
+    url = "https://maps.googleapis.com/maps/api/geocode/json"
+    params = {"latlng": f"{lat},{lng}", "key": GOOGLE_PLACES_API_KEY}
+    
+    resp = http_get(url, params)
+    if resp["google_status"] != "OK":
+        return None
+    
+    results = resp["json"].get("results", [])
+    for result in results[:3]:  # Check first 3 results
+        zip_code = extract_zip_from_components(result.get("address_components", []))
+        if zip_code:
+            return zip_code
+    
+    return None
+
+# ===========================
+# SCORING FUNCTIONS
+# ===========================
+
+def tract_from_latlng(lat: float, lng: float) -> Optional[str]:
+    """Get census tract from coordinates"""
+    if tracts_gdf is None or pd.isna(lat) or pd.isna(lng):
+        return None
+    try:
+        pt = gpd.GeoDataFrame(geometry=[Point(float(lng), float(lat))], crs="EPSG:4326")
+        tg = tracts_gdf.to_crs("EPSG:4326") if str(tracts_gdf.crs) != "EPSG:4326" else tracts_gdf
+        hit = gpd.sjoin(pt, tg[["GEOID", "geometry"]], how="left", predicate="within")
+        geoid = hit.iloc[0]["GEOID"]
+        return str(geoid) if pd.notna(geoid) else None
+    except Exception:
+        return None
+
+def zip_to_county(zip5: str) -> Optional[str]:
+    """Get primary county for ZIP code"""
+    if zip_county.empty or not zip5:
+        return None
+    z = norm_zip(zip5)
+    matches = zip_county[zip_county["zip"] == z]
+    if matches.empty:
+        return None
+    
+    # Return county with highest ratio
+    if "TOT_RATIO" in matches.columns:
+        best = matches.loc[matches["TOT_RATIO"].idxmax()]
+        return best["county_fips"]
+    else:
+        return matches.iloc[0]["county_fips"]
+
+def score_affluence(tract: Optional[str], zip5: Optional[str]) -> Dict:
+    """SES scoring: tract -> zip (no county fallback)"""
+    if tract and tract in ses_tract and ses_tract[tract] is not None:
+        score = float(ses_tract[tract])
+        return {"score": score, "stars": round(score/20.0, 1), "basis": "tract", "has_data": True}
+    
+    z = norm_zip(zip5)
+    if z and z in ses_zip and ses_zip[z] is not None:
+        score = float(ses_zip[z])
+        return {"score": score, "stars": round(score/20.0, 1), "basis": "zip", "has_data": True}
+    
+    return {"score": None, "stars": None, "basis": None, "has_data": False}
+
+def score_newness(build_year: Optional[int]) -> Dict:
+    """Newness scoring from build year"""
+    if build_year is None:
+        return {"score": None, "stars": None, "age_years": None, "has_data": False}
+    
+    try:
+        year = int(build_year)
+        current_year = datetime.now().year
+        age = max(0, current_year - year)
+        
+        if age <= 3: stars = 5.0
+        elif age <= 9: stars = 4.0
+        elif age <= 20: stars = 3.0
+        elif age <= 39: stars = 2.0
+        else: stars = 1.0
+        
+        score = stars * 20.0
+        return {"score": score, "stars": stars, "age_years": age, "has_data": True}
+    except (TypeError, ValueError):
+        return {"score": None, "stars": None, "age_years": None, "has_data": False}
+
+def score_flood(zip5: Optional[str], county_fips: Optional[str]) -> Dict:
+    """Flood scoring: ZIP -> county fallback (only if ZIP row missing)"""
+    z = norm_zip(zip5)
+    
+    # Try ZIP first
+    if z and not flood_zip.empty:
+        matches = flood_zip[flood_zip["zip_code"] == z]
+        if not matches.empty and pd.notna(matches.iloc[0]["flood_proportion_raw"]):
+            prop = float(matches.iloc[0]["flood_proportion_raw"])
+            score = max(0.0, min(100.0, (1.0 - prop) * 100.0))
+            return {"score": score, "stars": round(score/20.0, 1), "basis": "zip", "has_data": True}
+    
+    # County fallback only if ZIP row missing
+    if county_fips and not flood_cnty.empty:
+        matches = flood_cnty[flood_cnty["county_fips"] == str(county_fips)]
+        if not matches.empty and pd.notna(matches.iloc[0]["avg_flood_proportion"]):
+            prop = float(matches.iloc[0]["avg_flood_proportion"])
+            score = max(0.0, min(100.0, (1.0 - prop) * 100.0))
+            return {"score": score, "stars": round(score/20.0, 1), "basis": "county", "has_data": True}
+    
+    return {"score": None, "stars": None, "basis": None, "has_data": False}
+
+def score_dryness(zip5: Optional[str], county_fips: Optional[str]) -> Dict:
+    """Dryness scoring: ZIP -> county fallback (only if ZIP row missing)"""
+    z = norm_zip(zip5)
+    
+    # Try ZIP first
+    if z and not dry_zip.empty:
+        matches = dry_zip[dry_zip["zip"] == z]
+        if not matches.empty and pd.notna(matches.iloc[0]["dryness_safety_0_100"]):
+            score = float(matches.iloc[0]["dryness_safety_0_100"])
+            return {"score": score, "stars": round(score/20.0, 1), "basis": "zip", "has_data": True}
+    
+    # County fallback only if ZIP row missing
+    if county_fips and not dry_cnty.empty:
+        matches = dry_cnty[dry_cnty["county_fips"] == str(county_fips)]
+        if not matches.empty and pd.notna(matches.iloc[0]["avg_dryness_safety_0_100"]):
+            score = float(matches.iloc[0]["avg_dryness_safety_0_100"])
+            return {"score": score, "stars": round(score/20.0, 1), "basis": "county", "has_data": True}
+    
+    return {"score": None, "stars": None, "basis": None, "has_data": False}
+
+def score_reviews(rating: Optional[float], count: Optional[int]) -> Dict:
+    """Reviews scoring with Bayesian smoothing"""
+    if rating is None or count is None:
+        return {"score": None, "stars": None, "has_data": False}
+    
+    try:
+        r = float(rating)
+        n = int(count)
+        
+        # Bayesian smoothing
+        prior = 3.9
+        weight = min(1.0, n/100.0)
+        adjusted = prior * (1 - weight) + r * weight
+        
+        # Linear mapping to 0-100
+        score = max(0.0, min(100.0, (adjusted - 1.0) / (5.0 - 1.0) * 100.0))
+        
+        # Penalty for poor ratings with many reviews
+        if r <= 3.0 and n >= 100:
+            score = max(0.0, score - 3.0)
+        
+        return {"score": score, "stars": round(score/20.0, 1), "has_data": True}
+    except (TypeError, ValueError):
+        return {"score": None, "stars": None, "has_data": False}
+
+def calculate_overall_score(affluence: Dict, newness: Dict, flood: Dict, dryness: Dict, reviews: Dict) -> Dict:
+    """Calculate overall score with weighted combination"""
+    core_weights = {"flood": 0.35, "newness": 0.25, "affluence": 0.20, "dryness": 0.05}
+    components = {"affluence": affluence, "newness": newness, "flood": flood, "dryness": dryness}
+    
+    # Check which core components have data
+    core_scores = {k: v["score"] for k, v in components.items() if v.get("has_data") and v.get("score") is not None}
+    
+    if len(core_scores) < 3:
+        return {"score": None, "stars": None, "has_data": False, "reason": "not_enough_core_components"}
+    
+    # Normalize weights for present components
+    present_weights = {k: w for k, w in core_weights.items() if k in core_scores}
+    weight_sum = sum(present_weights.values())
+    
+    # Adjust for reviews
+    reviews_present = reviews.get("has_data") and reviews.get("score") is not None
+    core_bucket = 0.85 if reviews_present else 1.0
+    normalized_weights = {k: (w / weight_sum) * core_bucket for k, w in present_weights.items()}
+    
+    # Calculate weighted score
+    overall = sum(core_scores[k] * normalized_weights[k] for k in normalized_weights)
+    
+    # Add reviews component
+    if reviews_present:
+        overall += reviews["score"] * 0.15
+    
+    # Apply guardrail cap
+    core_min = min(core_scores.values())
+    if core_min < 40.0:
+        overall = min(overall, core_min)
+    
+    return {"score": round(overall, 1), "stars": round(overall/20.0, 1), "has_data": True}
+
+def score_place(place_data: Dict) -> Dict:
+    """Score a single place with all components"""
+    lat = place_data.get("lat")
+    lng = place_data.get("lng")
+    zip_code = place_data.get("zip")
+    build_year = place_data.get("build_year")
+    rating = place_data.get("google_rating")
+    review_count = place_data.get("google_review_count")
+    
+    # Get tract and county
+    tract = tract_from_latlng(lat, lng) if lat and lng else None
+    county = zip_to_county(zip_code) if zip_code else None
+    
+    # Calculate all scores
+    affluence = score_affluence(tract, zip_code)
+    newness = score_newness(build_year)
+    flood = score_flood(zip_code, county)
+    dryness = score_dryness(zip_code, county)
+    reviews = score_reviews(rating, review_count)
+    overall = calculate_overall_score(affluence, newness, flood, dryness, reviews)
+    
+    return {
+        "tract_geoid": tract,
+        "county_fips": county,
+        "affluence": affluence,
+        "newness": newness, 
+        "flood": flood,
+        "dryness": dryness,
+        "reviews": reviews,
+        "overall": overall
+    }
+
+# ===========================
+# AREA CACHE MANAGEMENT
+# ===========================
+
+def get_cached_places_for_area(area_key: str) -> Tuple[List[Dict], Dict]:
+    """Get cached places for an area, filtering out expired ones"""
+    cache_file = get_area_cache_file(area_key)
+    cache_data = load_json_with_lock(cache_file)
+    
+    if not cache_data or "results" not in cache_data:
+        return [], {"from_cache": 0, "expired_removed": 0}
+    
+    # Filter out expired places
+    expiry_threshold = datetime.now(timezone.utc) - timedelta(days=30 * DATA_EXPIRY_MONTHS)
+    original_count = len(cache_data["results"])
+    
+    valid_places = []
+    for place in cache_data["results"]:
+        scored_at_str = place.get("metadata", {}).get("scored_at")
+        if scored_at_str:
+            try:
+                scored_at = datetime.fromisoformat(scored_at_str.replace('Z', '+00:00'))
+                if scored_at > expiry_threshold:
+                    valid_places.append(place)
+            except ValueError:
+                continue  # Skip places with invalid timestamps
+    
+    expired_count = original_count - len(valid_places)
+    
+    # Update cache file if we removed expired places
+    if expired_count > 0:
+        cache_data["results"] = valid_places
+        cache_data["last_cleanup"] = datetime.now(timezone.utc).isoformat()
+        save_json_with_lock(cache_file, cache_data)
+    
+    return valid_places, {"from_cache": len(valid_places), "expired_removed": expired_count}
+
+def get_area_completeness(area_key: str) -> Dict:
+    """Get area completeness info"""
+    completeness_file = get_area_completeness_file()
+    completeness_data = load_json_with_lock(completeness_file)
+    
+    area_info = completeness_data.get(area_key, {})
+    return {
+        "total_available": area_info.get("total_available", 0),
+        "is_exhausted": area_info.get("is_exhausted", False),
+        "last_full_scan": area_info.get("last_full_scan"),
+        "scan_version": area_info.get("scan_version")
+    }
+
+def update_area_completeness(area_key: str, total_found: int, is_exhausted: bool):
+    """Update area completeness tracking"""
+    completeness_file = get_area_completeness_file()
+    completeness_data = load_json_with_lock(completeness_file)
+    
+    completeness_data[area_key] = {
+        "total_available": total_found,
+        "is_exhausted": is_exhausted,
+        "last_full_scan": datetime.now(timezone.utc).isoformat(),
+        "scan_version": MODEL_VERSION
+    }
+    
+    save_json_with_lock(completeness_file, completeness_data)
+
+def save_area_cache(area_key: str, places: List[Dict], scan_metadata: Dict):
+    """Save area scan results to cache file"""
+    cache_file = get_area_cache_file(area_key)
+    
+    cache_data = {
+        "area_key": area_key,
+        "scan_metadata": scan_metadata,
+        "total_places": len(places),
+        "cached_at": datetime.now(timezone.utc).isoformat(),
+        "model_version": MODEL_VERSION,
+        "scoring_version": SCORING_VERSION,
+        "results": places
+    }
+    
+    save_json_with_lock(cache_file, cache_data)
+    logger.info(f"Saved {len(places)} places to cache for {area_key}")
+
+# ===========================
+# PERPLEXITY ENRICHMENT
+# ===========================
+
+def fetch_build_year_with_perplexity(hotel_name: str, address: str) -> Optional[Dict]:
+    """Get build year from Perplexity API"""
+    if not PERPLEXITY_API_KEY:
+        return None
+    
+    prompt = f"""Find the exact construction year for this hotel:
+Hotel: {hotel_name}
+Address: {address}
+
+Return JSON only: {{"year": <4-digit-year>, "confidence": <0-100>}}"""
+    
+    try:
+        response = requests.post(
+            "https://api.perplexity.ai/chat/completions",
+            headers={"Authorization": f"Bearer {PERPLEXITY_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model": "sonar",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0
+            },
+            timeout=45
+        )
+        response.raise_for_status()
+        
+        content = response.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        return json.loads(content.strip("`"))
+    except Exception:
+        return None
+
+# ===========================
+# FASTAPI APPLICATION
+# ===========================
+
+app = FastAPI(
+    title="Hotel Safety Score API",
+    description="File-based cache hotel safety scoring with area scanning",
+    version="1.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Configure properly for production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class AreaScanRequest(BaseModel):
+    area_key: str
+    max_locations: Optional[int] = Field(default=None)
+    force_refresh: bool = False
+
+@app.get("/")
+def read_root():
+    return {
+        "message": "Hotel Safety Score API",
+        "version": "1.0", 
+        "storage": "file-based",
+        "endpoints": ["/v1/area/scan-and-score", "/health", "/docs"]
+    }
+
+@app.get("/health")
+def health_check():
+    # Check data files
+    data_files_count = sum(1 for f in FILES.values() if f.exists())
+    
+    # Check cache directory
+    cache_files = len(list(CACHE_DATA.glob("*.json"))) if CACHE_DATA.exists() else 0
+    
+    return {
+        "status": "healthy",
+        "storage": "file-based",
+        "data_mount": str(DATA),
+        "static_files": data_files_count,
+        "cache_files": cache_files,
+        "google_api": bool(GOOGLE_PLACES_API_KEY),
+        "perplexity_api": bool(PERPLEXITY_API_KEY),
+        "config": {
+            "max_locations": MAX_LOCATIONS_TO_SCAN,
+            "expiry_months": DATA_EXPIRY_MONTHS
+        },
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+@app.post("/v1/area/scan-and-score")
+async def area_scan_and_score(request: AreaScanRequest):
+    """Unified endpoint: scan area and return scored hotels/motels with file-based caching"""
+    
+    max_locations = request.max_locations or MAX_LOCATIONS_TO_SCAN
+    
+    # Parse city/state from area_key
+    if request.area_key.startswith("city:"):
+        location = request.area_key.replace("city:", "").strip()
+        if "," in location:
+            city, state = [s.strip() for s in location.split(",")]
+        else:
+            city, state = location, ""
+    else:
+        city, state = "", ""
+    
+    try:
+        # 1. Check area completeness
+        completeness = get_area_completeness(request.area_key)
+        
+        # 2. Get cached places (auto-removes expired)
+        cached_places, cache_stats = get_cached_places_for_area(request.area_key)
+        
+        # 3. Determine if Google API call needed
+        needs_google_scan = (
+            request.force_refresh or
+            not completeness["is_exhausted"] or
+            len(cached_places) < min(max_locations, completeness["total_available"]) or
+            (completeness["last_full_scan"] and 
+             datetime.fromisoformat(completeness["last_full_scan"].replace('Z', '+00:00')) < 
+             datetime.now(timezone.utc) - timedelta(days=AREA_RESCAN_DAYS))
+        )
+        
+        new_places = []
+        google_exhausted = False
+        
+        if needs_google_scan and GOOGLE_PLACES_API_KEY:
+            # 4. Google Places search
+            places_needed = max(0, max_locations - len(cached_places))
+            query = f"hotels in {city}, {state}" if city else request.area_key.replace("city:", "")
+            
+            logger.info(f"Searching Google for {places_needed} hotels in {query}")
+            google_results = google_text_search(query, places_needed)
+            google_exhausted = len(google_results) < places_needed
+            
+            # 5. Process each place
+            for place in google_results:
+                try:
+                    # Skip if already in cache
+                    if any(cp["place_id"] == place["place_id"] for cp in cached_places):
+                        continue
+                    
+                    # Get details
+                    details, status = google_place_details(place["place_id"])
+                    if status != "success" or not details:
+                        continue
+                    
+                    # Try reverse geocoding if no ZIP
+                    if not details["zip"] and details["geometry"]:
+                        lat = details["geometry"].get("lat")
+                        lng = details["geometry"].get("lng")
+                        if lat and lng:
+                            zip_from_reverse = reverse_geocode_for_zip(lat, lng)
+                            if zip_from_reverse:
+                                details["zip"] = zip_from_reverse
+                                details["zip_source"] = "reverse_geocode"
+                    
+                    # Parse address for city/state
+                    address_parts = (details["address"] or "").split(", ")
+                    parsed_city = city or (address_parts[-3] if len(address_parts) >= 3 else "")
+                    parsed_state = state or (address_parts[-2].split()[0] if len(address_parts) >= 2 else "")
+                    
+                    # Get build year (optional Perplexity enrichment)
+                    build_year = None
+                    if PERPLEXITY_API_KEY and details["name"] and details["address"]:
+                        perplexity_result = fetch_build_year_with_perplexity(details["name"], details["address"])
+                        if perplexity_result and perplexity_result.get("year"):
+                            build_year = perplexity_result["year"]
+                    
+                    # Score the place
+                    place_for_scoring = {
+                        "lat": details["geometry"].get("lat"),
+                        "lng": details["geometry"].get("lng"),
+                        "zip": details["zip"],
+                        "build_year": build_year,
+                        "google_rating": details["rating"],
+                        "google_review_count": details["user_ratings_total"]
+                    }
+                    
+                    scores = score_place(place_for_scoring)
+                    
+                    # Format for UI response
+                    place_result = {
+                        "place_id": details["place_id"],
+                        "name": details["name"],
+                        "address": details["address"],
+                        "lat": details["geometry"].get("lat"),
+                        "lng": details["geometry"].get("lng"),
+                        "zip": details["zip"],
+                        "zip_source": details["zip_source"],
+                        "primary_type": "hotel" if "hotel" in str(details["types"]).lower() else "motel",
+                        "build_year": build_year,
+                        "age_years": scores["newness"].get("age_years"),
+                        "overall": {
+                            "score": scores["overall"]["score"],
+                            "stars": scores["overall"]["stars"]
+                        },
+                        "components": {
+                            "newness": {
+                                "score": scores["newness"]["score"],
+                                "stars": scores["newness"]["stars"],
+                                "basis": "calculated"
+                            },
+                            "affluence": {
+                                "score": scores["affluence"]["score"],
+                                "stars": scores["affluence"]["stars"],
+                                "basis": scores["affluence"]["basis"],
+                                "aqi": int(scores["affluence"]["score"]) if scores["affluence"]["score"] else None,
+                                "aqi_label": "Good" if scores["affluence"]["score"] and scores["affluence"]["score"] >= 50 else "Poor"
+                            },
+                            "flood": {
+                                "score": scores["flood"]["score"],
+                                "stars": scores["flood"]["stars"],
+                                "basis": scores["flood"]["basis"]
+                            },
+                            "dryness": {
+                                "score": scores["dryness"]["score"],
+                                "stars": scores["dryness"]["stars"],
+                                "basis": scores["dryness"]["basis"],
+                                "peak_humidity": "62%",  # Could calculate from raw data
+                                "peak_dew_point": "55°F",
+                                "humidity_label": "average"
+                            }
+                        },
+                        "google": {
+                            "rating": details["rating"],
+                            "review_count": details["user_ratings_total"]
+                        },
+                        "metadata": {
+                            "cached": False,
+                            "scored_at": datetime.now(timezone.utc).isoformat(),
+                            "expires_at": (datetime.now(timezone.utc) + timedelta(days=30 * DATA_EXPIRY_MONTHS)).isoformat(),
+                            "tract_geoid": scores["tract_geoid"],
+                            "county_fips": scores["county_fips"]
+                        }
+                    }
+                    
+                    new_places.append(place_result)
+                    
+                except Exception as e:
+                    logger.error(f"Error processing place {place.get('place_id', 'unknown')}: {e}")
+                    continue
+        
+        # 6. Update area completeness
+        total_found = len(cached_places) + len(new_places)
+        update_area_completeness(request.area_key, total_found, google_exhausted)
+        
+        # 7. Combine results and save to cache
+        all_places = cached_places + new_places
+        
+        if new_places:  # Save cache if we have new data
+            scan_metadata = {
+                "scanned_at": datetime.now(timezone.utc).isoformat(),
+                "google_exhausted": google_exhausted,
+                "total_requested": max_locations,
+                "newly_added": len(new_places)
+            }
+            save_area_cache(request.area_key, all_places, scan_metadata)
+        
+        # 8. Mark cached items in metadata
+        for place in cached_places:
+            if "metadata" in place:
+                place["metadata"]["cached"] = True
+        
+        # 9. Return top results
+        final_results = sorted(all_places, key=lambda x: x.get("overall", {}).get("score", 0), reverse=True)[:max_locations]
+        
+        return {
+            "area_key": request.area_key,
+            "total_found": len(all_places),
+            "from_cache": cache_stats["from_cache"],
+            "newly_scored": len(new_places),
+            "expired_removed": cache_stats["expired_removed"],
+            "cache_hit_rate": round(cache_stats["from_cache"] / max(1, len(all_places)) * 100, 1),
+            "is_exhausted": google_exhausted,
+            "results": final_results
+        }
+        
+    except Exception as e:
+        logger.error(f"Area scan error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/v1/debug/cache")
+def debug_cache():
+    """Debug cache file status"""
+    cache_files = list(CACHE_DATA.glob("*.json")) if CACHE_DATA.exists() else []
+    completeness_file = get_area_completeness_file()
+    
+    cache_info = {}
+    for cache_file in cache_files:
+        try:
+            data = load_json_with_lock(cache_file)
+            cache_info[cache_file.stem] = {
+                "file_size_kb": round(cache_file.stat().st_size / 1024, 1),
+                "places_count": len(data.get("results", [])),
+                "cached_at": data.get("cached_at"),
+                "model_version": data.get("model_version")
             }
         except Exception as e:
-            logger.warning(f"NFHL query error: {e}")
-            return {}
-
-def compute_zone_safety(nfhl: Dict[str, Any]) -> int:
-    z = (nfhl.get("zone") or "").upper().strip()
-    sub = (nfhl.get("zone_subtype") or "").upper()
-    sfha = nfhl.get("sfha")
-    depth = nfhl.get("depth_ft")
-
-    if "FLOODWAY" in sub:
-        return 10
-    if z.startswith("VE"):
-        return 15
-    if sfha is True:
-        base = 25
-        try:
-            d = float(depth) if depth is not None else None
-            if d is not None:
-                if d >= 3.0: base = 15
-                elif d >= 1.0: base = 20
-        except Exception:
-            pass
-        return int(base)
-    if z in ("X", "B", "C"):
-        return 90
-    if "SHADED" in z or "0.2 PCT ANNUAL CHANCE" in sub or z == "D":
-        return 55
-    if sfha is False:
-        return 80
-    if depth is not None and (not z) and (sfha is None):
-        try:
-            d = float(depth)
-            if d >= 3.0: return 15
-            if d >= 1.0: return 20
-            return 25
-        except Exception:
-            return 25
-    return 55
-
-def combine_flood_resilience(nfhl_attrs: Dict[str, Any],
-                             claims_safety_0_100: Optional[float]) -> Tuple[Optional[int], Optional[float]]:
-    zone = compute_zone_safety(nfhl_attrs) if nfhl_attrs else None
-    if zone is None and claims_safety_0_100 is None:
-        return None, None
-
-    if zone is not None and claims_safety_0_100 is not None:
-        safety = 0.65 * float(zone) + 0.35 * float(claims_safety_0_100)
-    elif zone is not None:
-        safety = float(zone)
-    else:
-        safety = float(claims_safety_0_100)
-
-    safety = max(10.0, min(100.0, float(round(safety))))
-    stars = round(((safety/100.0)*5.0)*2)/2.0
-    return int(safety), stars
-
-async def query_nfhl_with_retries(lat: float, lon: float, max_attempts: int = 3) -> Dict[str, Any]:
-    nfhl = {}
-    for _ in range(max_attempts):
-        nfhl = await query_fema_nfhl(lat, lon)
-        if nfhl and any(nfhl.get(k) for k in ("zone", "zone_subtype", "sfha", "depth_ft")):
-            break
-    return nfhl or {}
-
-# ---------------------------------------------------------------------
-# Perplexity build-year
-# ---------------------------------------------------------------------
-class BuildYearRequest(BaseModel):
-    hotel_name: str = Field(..., description="Hotel name")
-    address: str = Field(..., description="Hotel address")
-
-async def query_perplexity(hotel_name: str, address: str) -> Dict[str, Any]:
-    if not PERPLEXITY_API_KEY:
-        return {"year": None, "source": "perplexity", "confidence": "low", "error": "No API key"}
-    url = "https://api.perplexity.ai/chat/completions"
-    headers = {"Authorization": f"Bearer {PERPLEXITY_API_KEY}", "Content-Type": "application/json"}
-    prompt = (
-        f"Extract the exact construction year for {hotel_name} at {address}.\n"
-        'Return JSON: {"year": int or null, "source": "perplexity", "confidence": "high/medium/low"}'
-    )
-    payload = {"model": PERPLEXITY_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}
-    try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            r = await client.post(url, headers=headers, json=payload)
-            if r.status_code != 200:
-                return {"year": None, "source": "perplexity", "confidence": "low"}
-            data = r.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
-            try:
-                obj = json.loads(content)
-                return {"year": obj.get("year"), "source": "perplexity", "confidence": obj.get("confidence", "medium")}
-            except Exception:
-                import re
-                m = re.search(r"\b(19|20)\d{2}\b", content)
-                if m:
-                    return {"year": int(m.group()), "source": "perplexity", "confidence": "low"}
-                return {"year": None, "source": "perplexity", "confidence": "low"}
-    except Exception:
-        return {"year": None, "source": "perplexity", "confidence": "low"}
-
-def year_to_score(year: Optional[int]) -> Optional[float]:
-    if not year:
-        return None
-    y = int(year)
-    now = datetime.now().year
-    if y >= now - 3:   return 100.0
-    if y >= now - 9:   return 85.0
-    if y >= now - 20:  return 65.0
-    if y >= 1986:      return 40.0
-    return 20.0
-
-# ---------------------------------------------------------------------
-# Google reviews (optional component for /score/total)
-# ---------------------------------------------------------------------
-def compute_google_component(rating: Optional[float], review_count: Optional[int]) -> Dict[str, Any]:
-    if rating is None or review_count is None or review_count <= 0:
-        return {"score100": None, "effective_weight": 0.0}
-
-    # normalize rating 1..5 to 0..1
-    normalized = max(0.0, min(1.0, (float(rating) - 1.0) / 4.0))
-    # saturating confidence by review count
-    k = 40.0
-    rc = min(float(review_count), 1000.0)
-    confidence = 1.0 - math.exp(-rc / k)
-    score100 = 100.0 * (normalized * confidence)
-
-    # asymmetric weight (bad ratings penalize more)
-    wg = 0.20 if rating < 3.0 else 0.10
-    return {"score100": score100, "effective_weight": wg}
-
-# ---------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------
-@app.get("/healthz")
-async def healthz():
-    return {"ok": True}
-
-@app.post("/reload/ses", dependencies=[Depends(verify_api_key)])
-async def reload_ses():
-    details = load_ses_data()
-    return {"success": True, "message": "SES data reloaded", "details": details}
-
-@app.post("/reload/humidity", dependencies=[Depends(verify_api_key)])
-async def reload_humidity():
-    details = load_humidity_data()
-    return {"success": True, "message": "Humidity data reloaded", "details": details}
-
-@app.post("/reload/flood_claims", dependencies=[Depends(verify_api_key)])
-async def reload_claims():
-    details = load_flood_claims()
-    return {"success": True, "message": "Claims data reloaded", "details": details}
-
-@app.post("/reload/affluence", dependencies=[Depends(verify_api_key)])
-async def reload_affluence():
-    details = load_zip_affluence()
-    return {"success": True, "message": "ZIP affluence reloaded", "details": details}
-
-@app.get("/ses/score", dependencies=[Depends(verify_api_key)])
-async def ses_score(lat: float = Query(...), lon: float = Query(...), zip: Optional[str] = Query(None)):
-    geoid, score = point_in_polygon_lookup(lat, lon)
-    fallback = None
-    if score is None and zip:
-        z = _zip_norm(zip)
-        aff = data_store.zip_affluence.get(z)
-        if aff is not None:
-            score = float(aff)
-            fallback = "zip_affluence"
-    return {"geoid": geoid, "ses_score_0_100": score, "fallback": fallback}
-
-@app.get("/humidity", dependencies=[Depends(verify_api_key)])
-async def humidity_score(zip: str = Query(...)):
-    z = _zip_norm(zip)
-    df = data_store.humidity
-    if df is None or z not in df.index:
-        return {"zip": z, "humidity_risk_0_100": None, "fallback": "none"}
-    row = df.loc[z]
-    # prefer primary risk; fallback to medians if missing
-    if pd.notna(row.get("humidity_risk_0_100")):
-        return {"zip": z, "humidity_risk_0_100": float(row["humidity_risk_0_100"]), "fallback": "primary"}
-    for f in ["humidity_nearest_median", "humidity_county_median", "humidity_state_median"]:
-        if f in row and pd.notna(row.get(f)):
-            return {"zip": z, "humidity_risk_0_100": float(row[f]), "fallback": f}
-    return {"zip": z, "humidity_risk_0_100": None, "fallback": "none"}
-
-@app.get("/flood", dependencies=[Depends(verify_api_key)])
-async def flood_score(lat: float = Query(...), lon: float = Query(...), zip: Optional[str] = Query(None)):
-    nfhl_status = {"attempts": 3, "available": None, "note": None}
-    nfhl_attrs: Dict[str, Any] = {}
-    try:
-        nfhl_attrs = await query_nfhl_with_retries(lat, lon, 3)
-        nfhl_status["available"] = bool(nfhl_attrs)
-        if not nfhl_attrs:
-            nfhl_status["note"] = "nfhl_unavailable_or_empty"
-    except Exception as e:
-        nfhl_status["available"] = False
-        nfhl_status["note"] = f"nfhl_error:{e}"
-
-    # Claims → safety (0–100) = (1 - proportion)*100; per policy no medians if missing
-    z = _zip_norm(zip) if zip else None
-    claims_prop = None
-    claims_safety = None
-    claims_missing = False
-    if z and data_store.claims is not None and z in data_store.claims.index:
-        val = data_store.claims.loc[z].get("claims_proportion_0_1")
-        if pd.notna(val):
-            claims_prop = float(val)
-            claims_safety = max(0.0, min(100.0, (1.0 - claims_prop) * 100.0))
-        else:
-            claims_missing = True
-    elif z:
-        claims_missing = True
-
-    safety_0_100, stars_5 = combine_flood_resilience(nfhl_attrs, claims_safety)
-
-    if safety_0_100 is None:
-        return {
-            "nfhl": {"attributes": nfhl_attrs or None, "status": nfhl_status},
-            "claims": {"zip5": z, "proportion_0_1": claims_prop,
-                       "claims_safety_0_100": claims_safety, "claims_missing": claims_missing},
-            "flood_safety_0_100": None,
-            "flood_safety_stars_5": None,
-            "low_confidence": True
-        }
-
-    low_conf = (not nfhl_attrs) or (claims_safety is None)
+            cache_info[cache_file.stem] = {"error": str(e)}
+    
+    completeness_data = load_json_with_lock(completeness_file) if completeness_file.exists() else {}
+    
     return {
-        "nfhl": {"attributes": nfhl_attrs or None, "status": nfhl_status},
-        "claims": {"zip5": z, "proportion_0_1": claims_prop,
-                   "claims_safety_0_100": claims_safety, "claims_missing": claims_missing},
-        "flood_safety_0_100": safety_0_100,
-        "flood_safety_stars_5": stars_5,
-        "low_confidence": low_conf
+        "cache_directory": str(CACHE_DATA),
+        "cache_files": cache_info,
+        "area_completeness": completeness_data,
+        "total_cache_files": len(cache_files)
     }
 
-@app.post("/build_year", dependencies=[Depends(verify_api_key)])
-async def build_year(req: BuildYearRequest):
-    res = await query_perplexity(req.hotel_name, req.address)
-    year = res.get("year")
-    score = year_to_score(year)
-    stars = None if score is None else round((score/100.0)*5.0, 1)
-    return {
-        "year": year,
-        "source": res.get("source", "perplexity"),
-        "confidence": res.get("confidence", "low"),
-        "score_0_100": score,
-        "stars_5": stars
-    }
+@app.post("/v1/admin/cleanup-expired")
+def cleanup_expired():
+    """Manual cleanup of expired places across all areas"""
+    cleaned_count = cleanup_expired_places()
+    return {"cleaned_places": cleaned_count, "cleaned_at": datetime.now(timezone.utc).isoformat()}
 
-@app.get("/score/total", dependencies=[Depends(verify_api_key)])
-async def total_score(
-    lat: float = Query(...),
-    lon: float = Query(...),
-    zip: Optional[str] = Query(None),
-    hotel_name: Optional[str] = Query(None),
-    address: Optional[str] = Query(None),
-    # optional Google reviews
-    rating: Optional[float] = Query(None),
-    review_count: Optional[int] = Query(None),
-):
-    components: Dict[str, Any] = {}
-    weights_used: Dict[str, float] = {}
+@app.get("/v1/debug/place")
+def debug_place(place_id: Optional[str] = Query(None), lat: Optional[float] = Query(None), lng: Optional[float] = Query(None)):
+    """Debug endpoint for place details and reverse geocoding"""
+    out = {"place_id": place_id, "lat": lat, "lng": lng}
 
-    # SES (tract) with ZIP affluence fallback
-    geoid, ses = point_in_polygon_lookup(lat, lon)
-    ses_fallback = None
-    if ses is None and zip:
-        z = _zip_norm(zip)
-        aff = data_store.zip_affluence.get(z)
-        if aff is not None:
-            ses = float(aff)
-            ses_fallback = "zip_affluence"
-    if ses is not None:
-        components["ses"] = {"geoid": geoid, "score_0_100": float(ses), "fallback": ses_fallback}
-        weights_used["ses"] = W_SES
+    if place_id:
+        details, status = google_place_details(place_id)
+        out["details_status"] = status
+        out["details_result"] = details
 
-    # Build year (optional)
-    if hotel_name and address:
-        by = await query_perplexity(hotel_name, address)
-        year = by.get("year")
-        by_score = year_to_score(year)
-        if by_score is not None:
-            components["build_year"] = {"year": year, "score_0_100": float(by_score),
-                                        "confidence": by.get("confidence", "low"),
-                                        "source": "perplexity"}
-            weights_used["build_year"] = W_BUILD_YEAR
+    if lat is not None and lng is not None:
+        zip_from_reverse = reverse_geocode_for_zip(lat, lng)
+        out["reverse_zip"] = zip_from_reverse
 
-    # Flood
-    flood = await flood_score(lat=lat, lon=lon, zip=zip)  # reuse endpoint logic
-    fs = flood.get("flood_safety_0_100")
-    if fs is not None:
-        components["flood_safety"] = {"score_0_100": float(fs), "details": flood}
-        weights_used["flood"] = W_FLOOD
+    return out
 
-    # Humidity (ZIP)
-    hz = None
-    if zip:
-        h = await humidity_score(zip=zip)
-        hz = h.get("humidity_risk_0_100")
-        if hz is not None:
-            hum_safe = 100.0 - float(hz)
-            components["humidity_safety"] = {"score_0_100": hum_safe, "raw_humidity_risk_0_100": float(hz),
-                                             "fallback": h.get("fallback")}
-            weights_used["humidity"] = W_HUMIDITY
-
-    # Google reviews (optional)
-    google_comp = compute_google_component(rating, review_count)
-    if google_comp["score100"] is not None:
-        components["google_reviews"] = {
-            "score_0_100": float(google_comp["score100"]),
-            "rating": rating, "review_count": review_count,
-            "effective_weight": google_comp["effective_weight"]
-        }
-
-    # Weight renormalization
-    if not weights_used and google_comp["score100"] is None:
-        return {
-            "inputs": {"lat": lat, "lon": lon, "zip": zip, "hotel_name": hotel_name, "address": address,
-                       "rating": rating, "review_count": review_count},
-            "components": components,
-            "weights_applied": {},
-            "total_score_0_100": None,
-            "total_stars_5": None
-        }
-
-    # If Google present → substitute effective weight then renormalize
-    wf = weights_used.get("flood", 0.0)
-    wn = weights_used.get("build_year", 0.0)
-    wa = weights_used.get("ses", 0.0)
-    wh = weights_used.get("humidity", 0.0)
-
-    if google_comp["score100"] is None:
-        total_w = wf + wn + wa + wh
-        wf /= total_w if total_w else 1.0
-        wn /= total_w if total_w else 1.0
-        wa /= total_w if total_w else 1.0
-        wh /= total_w if total_w else 1.0
-        wg = 0.0
-    else:
-        wg = float(google_comp["effective_weight"])
-        # keep base placeholders (they already approximate sum=0.90 without Google)
-        sumw = wf + wn + wa + wh + wg
-        wf /= sumw; wn /= sumw; wa /= sumw; wh /= sumw; wg /= sumw
-
-    total = 0.0
-    if fs is not None: total += wf * float(fs)
-    if "build_year" in components: total += wn * components["build_year"]["score_0_100"]
-    if ses is not None: total += wa * float(ses)
-    if hz is not None: total += wh * (100.0 - float(hz))
-    if google_comp["score100"] is not None: total += wg * float(google_comp["score100"])
-
-    total_100 = round(total, 1)
-    # MVP cap rule: if any core < 40 (flood, newness, affluence, humidity), cap to min
-    redflags: List[float] = []
-    if fs is not None: redflags.append(float(fs))
-    if "build_year" in components: redflags.append(float(components["build_year"]["score_0_100"]))
-    if ses is not None: redflags.append(float(ses))
-    if hz is not None: redflags.append(100.0 - float(hz))
-    if redflags and min(redflags) < 40.0:
-        total_100 = min(total_100, round(min(redflags), 1))
-    stars = round((total_100/100.0)*5.0, 1)
-
-    return {
-        "inputs": {"lat": lat, "lon": lon, "zip": zip, "hotel_name": hotel_name, "address": address,
-                   "rating": rating, "review_count": review_count},
-        "components": components,
-        "weights_applied": {"flood": round(wf, 4), "build_year": round(wn, 4),
-                            "ses": round(wa, 4), "humidity": round(wh, 4),
-                            "google_reviews": round(wg, 4)},
-        "total_score_0_100": total_100,
-        "total_stars_5": stars
-    }
-
-# ---------------------------------------------------------------------
-# Startup
-# ---------------------------------------------------------------------
-@app.on_event("startup")
-async def startup_event():
-    logger.info("Starting Property Score API...")
-    try: load_ses_data()
-    except Exception as e: logger.warning(f"SES load failed: {e}")
-    try: load_humidity_data()
-    except Exception as e: logger.warning(f"Humidity load failed: {e}")
-    try: load_flood_claims()
-    except Exception as e: logger.warning(f"Claims load failed: {e}")
-    try: load_zip_affluence()
-    except Exception as e: logger.warning(f"ZIP affluence load failed: {e}")
-    logger.info("Property Score API ready.")
-
-# ---------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------
 if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "8000")),
-        reload=os.getenv("ENV", "production") == "development"
-    )
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)

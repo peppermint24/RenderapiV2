@@ -46,10 +46,10 @@ AREA_RESCAN_DAYS = int(os.getenv("AREA_RESCAN_DAYS", "30"))
 MODEL_VERSION = os.getenv("MODEL_VERSION", "risk-v1")
 SCORING_VERSION = os.getenv("SCORING_VERSION", "2025-08-29")
 
-# Data paths - GitHub repo storage
-DATA = Path("./data")
-CACHE_DATA = Path("./cache")
-AREAS_DATA = Path("./areas")
+# Data paths - Your Render persistent disk
+DATA = Path("/data")
+CACHE_DATA = Path("/data/cache")
+AREAS_DATA = Path("/data/areas")
 
 # Ensure cache directories exist
 CACHE_DATA.mkdir(parents=True, exist_ok=True)
@@ -69,7 +69,7 @@ FILES = {
 # Verify data directory on startup
 if not DATA.exists():
     logger.error(f"Data directory {DATA} does not exist!")
-    logger.info("Current directory contents:", [p.name for p in Path(".").iterdir()])
+    logger.info("Available directories:", [p.name for p in Path("/").iterdir() if p.is_dir()])
 else:
     logger.info(f"Data directory found at {DATA}")
     logger.info(f"Data files: {[f.name for f in DATA.iterdir() if f.is_file()]}")

@@ -46,36 +46,33 @@ AREA_RESCAN_DAYS = int(os.getenv("AREA_RESCAN_DAYS", "30"))
 MODEL_VERSION = os.getenv("MODEL_VERSION", "risk-v1")
 SCORING_VERSION = os.getenv("SCORING_VERSION", "2025-08-29")
 
-# Data paths - Render persistent disk mount
-DATA_MOUNT_PATH = os.getenv("DATA_MOUNT_PATH", "/mnt/data")
-DATA = Path(DATA_MOUNT_PATH)
-STATIC_DATA = DATA / "static"
-CACHE_DATA = DATA / "cache"
-AREAS_DATA = DATA / "areas"
+# Data paths - GitHub repo storage
+DATA = Path("./data")
+CACHE_DATA = Path("./cache")
+AREAS_DATA = Path("./areas")
 
 # Ensure cache directories exist
 CACHE_DATA.mkdir(parents=True, exist_ok=True)
 AREAS_DATA.mkdir(parents=True, exist_ok=True)
 
 FILES = {
-    "SES_TRACT": STATIC_DATA / "Tract Lookup Fixed.json",
-    "SES_ZIP": STATIC_DATA / "Zip Fallback SES Aug 29.json",
-    "FLOOD_ZIP": STATIC_DATA / "flood_zip_floodprop.csv",
-    "FLOOD_CNTY": STATIC_DATA / "County Flood Fallback.csv",
-    "DRY_ZIP": STATIC_DATA / "Humidity Dryness Scores Aug 29.csv",
-    "DRY_CNTY": STATIC_DATA / "County Dryness Data Aug 29.csv",
-    "ZIP_COUNTY": STATIC_DATA / "ZIP_COUNTY_062025.xlsx",
-    "TRACTS_GPKG": STATIC_DATA / "us_all_tracts_2022.gpkg",
+    "SES_TRACT": DATA / "Tract Lookup Fixed.json",
+    "SES_ZIP": DATA / "Zip Fallback SES Aug 29.json",
+    "FLOOD_ZIP": DATA / "flood_zip_floodprop.csv",
+    "FLOOD_CNTY": DATA / "County Flood Fallback.csv",
+    "DRY_ZIP": DATA / "Humidity Dryness Scores Aug 29.csv",
+    "DRY_CNTY": DATA / "County Dryness Data Aug 29.csv",
+    "ZIP_COUNTY": DATA / "ZIP_COUNTY_062025.xlsx",
+    "TRACTS_GPKG": DATA / "us_all_tracts_2022.gpkg",
 }
 
-# Verify data mount on startup
+# Verify data directory on startup
 if not DATA.exists():
-    logger.error(f"Data mount path {DATA} does not exist!")
-    logger.info("Available paths:", [p for p in Path("/").iterdir() if p.is_dir()])
+    logger.error(f"Data directory {DATA} does not exist!")
+    logger.info("Current directory contents:", [p.name for p in Path(".").iterdir()])
 else:
-    logger.info(f"Data mount found at {DATA}")
-    if STATIC_DATA.exists():
-        logger.info(f"Static data files: {[f.name for f in STATIC_DATA.iterdir() if f.is_file()]}")
+    logger.info(f"Data directory found at {DATA}")
+    logger.info(f"Data files: {[f.name for f in DATA.iterdir() if f.is_file()]}")
 
 # ===========================
 # FILE-BASED CACHE HELPERS
@@ -697,9 +694,9 @@ def health_check():
     
     return {
         "status": "healthy",
-        "storage": "file-based",
-        "data_mount": str(DATA),
-        "static_files": data_files_count,
+        "storage": "file-based-repo",
+        "data_directory": str(DATA),
+        "data_files": data_files_count,
         "cache_files": cache_files,
         "google_api": bool(GOOGLE_PLACES_API_KEY),
         "perplexity_api": bool(PERPLEXITY_API_KEY),

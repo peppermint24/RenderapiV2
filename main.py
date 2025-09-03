@@ -225,13 +225,8 @@ def http_get(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 def is_hotel_or_motel(place_types: List[str]) -> bool:
-    """Filter to only hotels and motels - TEMPORARILY DISABLED FOR TESTING"""
-    if not place_types:
-        return False
-    types_str = " ".join(place_types).lower()
-    # Temporarily accept all lodging types to debug
-    return "lodging" in types_str or "hotel" in types_str or "motel" in types_str or "establishment" in types_str
-    # Original strict filter: return "hotel" in types_str or "motel" in types_str
+    """TEMPORARILY ACCEPT ALL PLACES FOR DEBUGGING"""
+    return True  # Accept everything to see what Google returns
 
 def google_text_search(query: str, max_results: int = 400) -> List[Dict]:
     """Search for hotels/motels with pagination"""

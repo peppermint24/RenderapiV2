@@ -1,6 +1,6 @@
 # ===========================
-# PRODUCTION FASTAPI APP - main.py
-# File-based caching with area JSON files on mounted disk
+# COMPLETE FASTAPI APP - main.py
+# File-based caching with area JSON files on Render persistent disk
 # ===========================
 
 import os
@@ -225,12 +225,20 @@ def http_get(url: str, params: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 def is_hotel_or_motel(place_types: List[str]) -> bool:
-    """TEMPORARILY ACCEPT ALL PLACES FOR DEBUGGING"""
-    return True  # Accept everything to see what Google returns
+    """TEMPORARILY ACCEPT ALL LODGING TYPES FOR DEBUGGING"""
+    if not place_types:
+        return False
+    types_str = " ".join(place_types).lower()
+    # Accept any lodging-related type for debugging
+    return any(lodging_type in types_str for lodging_type in [
+        "lodging", "hotel", "motel", "establishment", "point_of_interest", 
+        "tourist_destination", "travel_agency"
+    ])
 
 def google_text_search(query: str, max_results: int = 400) -> List[Dict]:
     """Search for hotels/motels with pagination"""
     if not GOOGLE_PLACES_API_KEY:
+        logger.error("No Google Places API key available")
         return []
     
     url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
@@ -239,9 +247,13 @@ def google_text_search(query: str, max_results: int = 400) -> List[Dict]:
     results = []
     page = 0
     
+    logger.info(f"Starting Google search for: {query}")
+    
     while len(results) < max_results:
         page += 1
         resp = http_get(url, params)
+        
+        logger.info(f"Google API response - Status: {resp['google_status']}, HTTP: {resp['http_status']}")
         
         if resp["google_status"] != "OK":
             logger.error(f"Google search failed: {resp}")
@@ -250,18 +262,24 @@ def google_text_search(query: str, max_results: int = 400) -> List[Dict]:
         data = resp["json"]
         page_results = data.get("results", [])
         
+        logger.info(f"Page {page}: Got {len(page_results)} raw results from Google")
+        
         # Filter to hotels/motels only
         filtered_results = [r for r in page_results if is_hotel_or_motel(r.get("types", []))]
+        logger.info(f"Page {page}: After filtering: {len(filtered_results)} lodging results")
+        
         results.extend(filtered_results)
         
         # Check for next page
         next_token = data.get("next_page_token")
         if not next_token or len(page_results) == 0:
+            logger.info(f"Search complete - no more pages")
             break
             
         time.sleep(2)  # Required delay for next_page_token
         params = {"pagetoken": next_token, "key": GOOGLE_PLACES_API_KEY}
     
+    logger.info(f"Final results: {len(results[:max_results])} hotels found")
     return results[:max_results]
 
 def extract_zip_from_components(components: list) -> Optional[str]:
@@ -691,7 +709,7 @@ def health_check():
     
     return {
         "status": "healthy",
-        "storage": "file-based-repo",
+        "storage": "file-based",
         "data_directory": str(DATA),
         "data_files": data_files_count,
         "cache_files": cache_files,
@@ -895,6 +913,21 @@ async def area_scan_and_score(request: AreaScanRequest):
     except Exception as e:
         logger.error(f"Area scan error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/v1/debug/google-search")
+def debug_google_search(query: str = "hotels in Santa Clara, CA"):
+    """Debug what Google Places Text Search returns"""
+    if not GOOGLE_PLACES_API_KEY:
+        return {"error": "No Google API key"}
+    
+    raw_results = google_text_search(query, 10)
+    
+    return {
+        "query": query,
+        "raw_count": len(raw_results),
+        "results": raw_results[:3] if raw_results else [],
+        "sample_types": [r.get("types", []) for r in raw_results[:3]] if raw_results else []
+    }
 
 @app.get("/v1/debug/cache")
 def debug_cache():
